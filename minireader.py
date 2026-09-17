@@ -13,9 +13,7 @@ Features:
 """
 
 import gzip
-import html
 import json
-import os
 import random
 import re
 import sys
@@ -63,6 +61,16 @@ AD_NOISE_RE = re.compile(
 SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 
 
+class StackFrame:
+    """HTML 标签解析栈帧，封装标签元数据以确保状态严格原子性"""
+    __slots__ = ("tag", "is_noise", "is_ignore")
+
+    def __init__(self, tag: str, is_noise: bool, is_ignore: bool):
+        self.tag = tag
+        self.is_noise = is_noise
+        self.is_ignore = is_ignore
+
+
 class HTMLToMarkdownParser(HTMLParser):
     """极简、健壮、无依赖的 HTML 到纯净 GFM Markdown 解析器"""
 
@@ -71,8 +79,7 @@ class HTMLToMarkdownParser(HTMLParser):
         self.base_url = base_url
         self.md_lines: List[str] = []
         self.current_line: List[str] = []
-        self.tag_stack: List[str] = []
-        self.noise_stack: List[bool] = []
+        self.tag_stack: List[StackFrame] = []
         self.in_ignore_count = 0
         self.in_noise_count = 0
         self.in_code_block = False
@@ -90,10 +97,27 @@ class HTMLToMarkdownParser(HTMLParser):
 
     def _append_inline(self, text: str):
         """将行内元素（文本、链接、行内代码、图片）路由到当前活跃缓冲区"""
-        if self.in_table:
+        if self.current_link is not None:
+            self.link_text.append(text)
+        elif self.in_table:
             self.current_cell.append(text)
         else:
             self.current_line.append(text)
+
+    def _flush_current_cell(self):
+        """将当前单元格冲刷入当前行，并安全转义未转义竖线"""
+        if self.current_cell:
+            cell_text = "".join(self.current_cell).strip().replace("\n", " ")
+            cell_text = re.sub(r"(?<!\\)\|", r"\|", cell_text)
+            self.current_row.append(cell_text)
+            self.current_cell = []
+
+    def _flush_current_row(self):
+        """将当前行冲刷入表格行列表"""
+        self._flush_current_cell()
+        if self.current_row:
+            self.table_rows.append(self.current_row)
+            self.current_row = []
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]):
         tag = tag.lower()
@@ -103,8 +127,7 @@ class HTMLToMarkdownParser(HTMLParser):
         if self.in_ignore_count > 0 or self.in_noise_count > 0:
             # 即使在忽略区域内，也只将非 void 标签压栈，保证 endtag 匹配
             if tag not in VOID_TAGS:
-                self.tag_stack.append(tag)
-                self.noise_stack.append(False)
+                self.tag_stack.append(StackFrame(tag, is_noise=False, is_ignore=False))
             return
 
         # MR-1: void 元素特殊处理，绝不压栈，避免造成栈失配
@@ -131,22 +154,21 @@ class HTMLToMarkdownParser(HTMLParser):
         is_noise = bool(cls_id and AD_NOISE_RE.search(cls_id))
         if is_noise:
             self.in_noise_count += 1
-        self.noise_stack.append(is_noise)
 
         # 2. 判断是否属于忽略标签
         is_ignore = False
         if tag in BASE_IGNORE_TAGS:
             is_ignore = True
-        elif tag in ["header", "footer"]:
+        elif tag in ("header", "footer"):
             # 正文容器（article/main/section）内部的 header/footer 保留内容，只剔除页面级全局噪点
-            in_content_container = any(t in ["article", "main", "section"] for t in self.tag_stack)
+            in_content_container = any(f.tag in ("article", "main", "section") for f in self.tag_stack)
             if not in_content_container:
                 is_ignore = True
 
         if is_ignore:
             self.in_ignore_count += 1
 
-        self.tag_stack.append(tag)
+        self.tag_stack.append(StackFrame(tag, is_noise=is_noise, is_ignore=is_ignore))
 
         if self.in_ignore_count > 0 or self.in_noise_count > 0:
             return
@@ -157,7 +179,7 @@ class HTMLToMarkdownParser(HTMLParser):
 
         if tag == "title":
             self.in_title = True
-        elif tag in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
             level = int(tag[1])
             self.current_line.append("#" * level + " ")
         elif tag == "pre":
@@ -167,9 +189,9 @@ class HTMLToMarkdownParser(HTMLParser):
             self._append_inline("`")
         elif tag == "blockquote":
             self.current_line.append("> ")
-        elif tag in ["b", "strong"]:
+        elif tag in ("b", "strong"):
             self._append_inline("**")
-        elif tag in ["i", "em"]:
+        elif tag in ("i", "em"):
             self._append_inline("*")
         elif tag == "ul":
             self.list_stack.append({"type": "ul", "count": 0})
@@ -202,10 +224,12 @@ class HTMLToMarkdownParser(HTMLParser):
         elif tag == "table":
             self.in_table = True
             self.table_rows = []
-        elif tag == "tr" and self.in_table:
             self.current_row = []
-        elif tag in ["th", "td"] and self.in_table:
             self.current_cell = []
+        elif tag == "tr" and self.in_table:
+            self._flush_current_row()
+        elif tag in ("th", "td") and self.in_table:
+            self._flush_current_cell()
 
     def handle_endtag(self, tag: str):
         tag = tag.lower()
@@ -215,23 +239,18 @@ class HTMLToMarkdownParser(HTMLParser):
             return
 
         # 向上查找匹配标签并容错弹出
-        if tag in self.tag_stack:
-            idx = len(self.tag_stack) - 1 - self.tag_stack[::-1].index(tag)
-            while len(self.tag_stack) > idx:
-                popped_tag = self.tag_stack.pop()
-                if self.noise_stack:
-                    was_noise = self.noise_stack.pop()
-                    if was_noise and self.in_noise_count > 0:
-                        self.in_noise_count -= 1
+        match_idx = -1
+        for i in range(len(self.tag_stack) - 1, -1, -1):
+            if self.tag_stack[i].tag == tag:
+                match_idx = i
+                break
 
-                is_ign = False
-                if popped_tag in BASE_IGNORE_TAGS:
-                    is_ign = True
-                elif popped_tag in ["header", "footer"]:
-                    in_container = any(t in ["article", "main", "section"] for t in self.tag_stack)
-                    if not in_container:
-                        is_ign = True
-                if is_ign and self.in_ignore_count > 0:
+        if match_idx != -1:
+            while len(self.tag_stack) > match_idx:
+                frame = self.tag_stack.pop()
+                if frame.is_noise and self.in_noise_count > 0:
+                    self.in_noise_count -= 1
+                if frame.is_ignore and self.in_ignore_count > 0:
                     self.in_ignore_count -= 1
 
         if self.in_ignore_count > 0 or self.in_noise_count > 0:
@@ -239,9 +258,9 @@ class HTMLToMarkdownParser(HTMLParser):
 
         if tag == "title":
             self.in_title = False
-        elif tag in ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "div", "section", "article", "main", "figure"]:
+        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "div", "section", "article", "main", "figure"):
             self._flush_current_line()
-        elif tag in ["ul", "ol"]:
+        elif tag in ("ul", "ol"):
             if self.list_stack:
                 self.list_stack.pop()
             self._flush_current_line()
@@ -261,28 +280,24 @@ class HTMLToMarkdownParser(HTMLParser):
             self.md_lines.append("```\n\n")
         elif tag == "code" and not self.in_code_block:
             self._append_inline("`")
-        elif tag in ["b", "strong"]:
+        elif tag in ("b", "strong"):
             self._append_inline("**")
-        elif tag in ["i", "em"]:
+        elif tag in ("i", "em"):
             self._append_inline("*")
         elif tag == "a":
-            if self.current_link:
+            if self.current_link is not None:
                 text = "".join(self.link_text).strip()
-                if text:
-                    self._append_inline(f"[{text}]({self.current_link})")
+                target_url = self.current_link
                 self.current_link = None
                 self.link_text = []
-        elif tag in ["th", "td"] and self.in_table:
-            cell_text = "".join(self.current_cell).strip().replace("\n", " ")
-            # 转义单元格内的未转义竖线 |，防止破坏 GFM 表格列对齐结构
-            cell_text = re.sub(r"(?<!\\)\|", r"\|", cell_text)
-            self.current_row.append(cell_text)
-            self.current_cell = []
+                if text:
+                    self._append_inline(f"[{text}]({target_url})")
+        elif tag in ("th", "td") and self.in_table:
+            self._flush_current_cell()
         elif tag == "tr" and self.in_table:
-            if self.current_row:
-                self.table_rows.append(self.current_row)
-                self.current_row = []
+            self._flush_current_row()
         elif tag == "table":
+            self._flush_current_row()
             self.in_table = False
             if self.table_rows:
                 col_count = max(len(r) for r in self.table_rows) if self.table_rows else 0
@@ -378,7 +393,9 @@ def fetch_url(url: str, timeout: int = 12) -> Tuple[str, str, str]:
         final_url = resp.geturl()
         content_type = resp.headers.get("Content-Type", "").lower()
         encoding = resp.headers.get("Content-Encoding", "").strip().lower()
-        raw_bytes = resp.read()
+        raw_bytes = resp.read(10 * 1024 * 1024 + 1)
+        if len(raw_bytes) > 10 * 1024 * 1024:
+            raise ValueError("Response body exceeded 10MB limit (protection against memory exhaustion)")
         charset = resp.headers.get_content_charset() or "utf-8"
         decoded_text = decompress_and_decode(raw_bytes, encoding=encoding, charset=charset)
         return decoded_text, final_url, content_type
@@ -387,12 +404,13 @@ def fetch_url(url: str, timeout: int = 12) -> Tuple[str, str, str]:
 def html_to_markdown(html_text: str, base_url: str = "", content_type: str = "text/html") -> str:
     """转换文本为纯净 Markdown（按 Content-Type 分派，单次反转义，杜绝代码被吞）"""
     ct = content_type.lower()
-    # 4. 非 HTML 响应按类型分派，保护 Markdown / JSON / 纯文本结构
-    if "text/markdown" in ct or "text/x-markdown" in ct or (html_text.strip().startswith("# ") and not ("<html" in html_text.lower() or "<body" in html_text.lower())):
+    head = html_text[:4096].lower()
+    # 非 HTML 响应按类型分派，保护 Markdown / JSON / 纯文本结构
+    if "text/markdown" in ct or "text/x-markdown" in ct or (html_text.strip().startswith("# ") and not ("<html" in head or "<body" in head)):
         return html_text.strip()
     elif "application/json" in ct:
         return f"```json\n{html_text.strip()}\n```"
-    elif "text/plain" in ct and not ("<html" in html_text.lower() or "<body" in html_text.lower()):
+    elif "text/plain" in ct and not ("<html" in head or "<body" in head):
         return html_text.strip()
 
     parser = HTMLToMarkdownParser(base_url=base_url)
@@ -421,11 +439,20 @@ def clean_read_url(url: str) -> Dict[str, Any]:
 # 标准 MCP (Model Context Protocol) 服务端实现
 # ==========================================
 
-def handle_mcp_message(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def handle_mcp_message(msg: Any) -> Optional[Dict[str, Any]]:
     """标准 MCP 请求路由处理，严格遵循 JSON-RPC 2.0 规范"""
+    if not isinstance(msg, dict):
+        return {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request: expected JSON object"}
+        }
+
     req_id = msg.get("id")
     method = msg.get("method")
-    params = msg.get("params", {})
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        params = {}
 
     # MR-5: JSON-RPC 规范：无 id 或方法为 notifications/* 一律为通知，绝不产生响应
     if req_id is None or (isinstance(method, str) and method.startswith("notifications/")):
@@ -473,7 +500,9 @@ def handle_mcp_message(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         }
     elif method == "tools/call":
         tool_name = params.get("name")
-        arguments = params.get("arguments", {})
+        arguments = params.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
         if tool_name == "read_web_page":
             target_url = arguments.get("url", "")
             if not target_url:
@@ -511,6 +540,12 @@ def handle_mcp_message(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "id": req_id,
                 "error": {"code": -32601, "message": f"Tool '{tool_name}' not found"}
             }
+    elif method == "ping":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {}
+        }
     else:
         return {
             "jsonrpc": "2.0",
@@ -610,12 +645,16 @@ def self_test():
         pass
     print("[+] 真实 decompress_and_decode 解压流水线与安全拦截测试通过！")
 
-    # 7. 测试 MCP 通知静默与协议协商 (MR-5, MR-6)
+    # 7. 测试 MCP 通知静默、协议协商与 ping 方法支持
     notif_res = handle_mcp_message({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})
     assert notif_res is None, "Notifications must not return response"
     init_res = handle_mcp_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2099-01-01"}})
     assert init_res["result"]["protocolVersion"] in SUPPORTED_PROTOCOL_VERSIONS
-    print("[+] MCP 通知静默与协议版本白名单协商测试通过！")
+    ping_res = handle_mcp_message({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+    assert ping_res == {"jsonrpc": "2.0", "id": 2, "result": {}}, "Ping method must return empty result"
+    null_arg_res = handle_mcp_message({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "read_web_page", "arguments": None}})
+    assert null_arg_res["result"]["isError"] is True
+    print("[+] MCP 通知静默、协议白名单、ping 规范与参数类型守卫测试通过！")
 
     print("[+] MiniReader 全部自检断言 100% 成功通过！")
 
