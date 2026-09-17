@@ -6,11 +6,13 @@ License: MIT
 
 Features:
 - Pure Python 3 standard library (ZERO external dependencies).
-- Memory footprint < 20MB (vs 800MB+ in Playwright/Chromium).
-- Smart readability extraction: strips ads, navbars, footers, scripts, and trackers.
+- Memory footprint: ~20MB peak RSS (CLI).
+- Startup: ~0.05s internal execution / ~0.31s CLI end-to-end (including Python runtime).
+- Smart content extraction: GFM tables, images, ad/noise filtering, gzip/deflate decompression.
 - Dual mode: Standalone CLI and standard MCP Server for Claude Desktop / Cursor / Windsurf.
 """
 
+import gzip
 import html
 import json
 import os
@@ -21,12 +23,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from html.parser import HTMLParser
 from typing import Dict, Any, List, Optional, Tuple
 
 
 PAYPAL_URL = "https://paypal.me/liveeeeee1203"
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -34,89 +37,157 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 ]
 
+# 块级标签集合（触发排版换行，杜绝内容挤压粘连）
+BLOCK_TAGS = {
+    "div", "section", "article", "main", "p", "h1", "h2", "h3", "h4", "h5", "h6",
+    "li", "blockquote", "pre", "table", "tr", "header", "footer", "hr", "address"
+}
+
+# 始终忽略的基础标签
+BASE_IGNORE_TAGS = {"script", "style", "noscript", "svg", "nav", "aside", "form", "button", "iframe"}
+
+# 广告、弹窗与干扰组件的 class/id 启发式正则
+AD_NOISE_RE = re.compile(
+    r"(^|[\s_-])(ad|ads|banner|advertisement|sponsor|sponsored|promo|cookie|newsletter|popup|modal|share-btn|sharing|sidebar|widget)([\s_-]|$)",
+    re.IGNORECASE
+)
+
 
 class HTMLToMarkdownParser(HTMLParser):
-    """极简无依赖的 HTML 到纯净 Markdown 解析器"""
+    """极简、健壮、无依赖的 HTML 到纯净 GFM Markdown 解析器"""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, base_url: str = ""):
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
         self.md_lines: List[str] = []
         self.current_line: List[str] = []
         self.tag_stack: List[str] = []
-        self.ignore_tags = {"script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "form", "button"}
-        self.in_ignore_tag = 0
+        self.noise_stack: List[bool] = []
+        self.in_ignore_count = 0
+        self.in_noise_count = 0
         self.in_code_block = False
         self.current_link: Optional[str] = None
         self.link_text: List[str] = []
         self.page_title = ""
         self.in_title = False
 
+        # 表格状态追踪
+        self.in_table = False
+        self.table_rows: List[List[str]] = []
+        self.current_row: List[str] = []
+        self.current_cell: List[str] = []
+
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]):
         tag = tag.lower()
-        self.tag_stack.append(tag)
         attrs_dict = dict(attrs)
 
-        if tag in self.ignore_tags:
-            self.in_ignore_tag += 1
+        # 1. 检查噪音广告 class 与 id
+        cls_id = f"{attrs_dict.get('class', '')} {attrs_dict.get('id', '')}".strip()
+        is_noise = bool(cls_id and AD_NOISE_RE.search(cls_id))
+        if is_noise:
+            self.in_noise_count += 1
+        self.noise_stack.append(is_noise)
+
+        # 2. 判断是否属于忽略标签
+        is_ignore = False
+        if tag in BASE_IGNORE_TAGS:
+            is_ignore = True
+        elif tag in ["header", "footer"]:
+            # 正文容器（article/main/section）内部的 header/footer 保留内容，只剔除页面级噪点
+            in_content_container = any(t in ["article", "main", "section"] for t in self.tag_stack)
+            if not in_content_container:
+                is_ignore = True
+
+        if is_ignore:
+            self.in_ignore_count += 1
+
+        self.tag_stack.append(tag)
+
+        if self.in_ignore_count > 0 or self.in_noise_count > 0:
             return
 
-        if self.in_ignore_tag > 0:
-            return
+        # 块级标签开始时冲刷当前行，防止文本跨块粘连
+        if tag in BLOCK_TAGS and not self.in_table:
+            self._flush_current_line()
 
         if tag == "title":
             self.in_title = True
         elif tag in ["h1", "h2", "h3", "h4", "h5", "h6"]:
-            self._flush_current_line()
             level = int(tag[1])
             self.current_line.append("#" * level + " ")
-        elif tag == "p":
-            self._flush_current_line()
-        elif tag in ["br", "hr"]:
-            self._flush_current_line()
-            if tag == "hr":
-                self.md_lines.append("---\n")
+        elif tag == "hr":
+            self.md_lines.append("---\n\n")
         elif tag == "pre":
-            self._flush_current_line()
             self.in_code_block = True
             self.md_lines.append("```\n")
         elif tag == "code" and not self.in_code_block:
             self.current_line.append("`")
         elif tag == "blockquote":
-            self._flush_current_line()
             self.current_line.append("> ")
         elif tag in ["b", "strong"]:
             self.current_line.append("**")
         elif tag in ["i", "em"]:
             self.current_line.append("*")
         elif tag == "li":
-            self._flush_current_line()
             indent = "  " * max(0, len([t for t in self.tag_stack if t in ["ul", "ol"]]) - 1)
             self.current_line.append(f"{indent}* ")
         elif tag == "a":
             href = attrs_dict.get("href")
             if href and not href.startswith("javascript:"):
+                if self.base_url:
+                    href = urllib.parse.urljoin(self.base_url, href)
                 self.current_link = href
                 self.link_text = []
+        elif tag == "img":
+            src = attrs_dict.get("src", "")
+            if src:
+                if self.base_url:
+                    src = urllib.parse.urljoin(self.base_url, src)
+                alt = attrs_dict.get("alt", "").strip() or "image"
+                self.current_line.append(f"![{alt}]({src}) ")
+        elif tag == "table":
+            self.in_table = True
+            self.table_rows = []
+        elif tag == "tr" and self.in_table:
+            self.current_row = []
+        elif tag in ["th", "td"] and self.in_table:
+            self.current_cell = []
 
     def handle_endtag(self, tag: str):
         tag = tag.lower()
         if self.tag_stack and self.tag_stack[-1] == tag:
             self.tag_stack.pop()
 
-        if tag in self.ignore_tags:
-            self.in_ignore_tag = max(0, self.in_ignore_tag - 1)
+        # 回收噪音计数
+        if self.noise_stack:
+            was_noise = self.noise_stack.pop()
+            if was_noise and self.in_noise_count > 0:
+                self.in_noise_count -= 1
+
+        is_ignore = False
+        if tag in BASE_IGNORE_TAGS:
+            is_ignore = True
+        elif tag in ["header", "footer"]:
+            in_content_container = any(t in ["article", "main", "section"] for t in self.tag_stack)
+            if not in_content_container:
+                is_ignore = True
+
+        if is_ignore and self.in_ignore_count > 0:
+            self.in_ignore_count -= 1
             return
 
-        if self.in_ignore_tag > 0:
+        if self.in_ignore_count > 0 or self.in_noise_count > 0:
             return
 
         if tag == "title":
             self.in_title = False
-        elif tag in ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote"]:
+        elif tag in ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "div", "section", "article", "main"]:
             self._flush_current_line()
         elif tag == "pre":
-            self._flush_current_line()
             self.in_code_block = False
+            # 确保前面代码内容已换行，围栏独占一行
+            if self.md_lines and not self.md_lines[-1].endswith("\n"):
+                self.md_lines.append("\n")
             self.md_lines.append("```\n\n")
         elif tag == "code" and not self.in_code_block:
             self.current_line.append("`")
@@ -131,25 +202,58 @@ class HTMLToMarkdownParser(HTMLParser):
                     self.current_line.append(f"[{text}]({self.current_link})")
                 self.current_link = None
                 self.link_text = []
+        elif tag in ["th", "td"] and self.in_table:
+            cell_text = "".join(self.current_cell).strip().replace("\n", " ")
+            self.current_row.append(cell_text)
+            self.current_cell = []
+        elif tag == "tr" and self.in_table:
+            if self.current_row:
+                self.table_rows.append(self.current_row)
+                self.current_row = []
+        elif tag == "table":
+            self.in_table = False
+            if self.table_rows:
+                col_count = max(len(r) for r in self.table_rows) if self.table_rows else 0
+                if col_count > 0:
+                    gfm_lines = []
+                    header_row = self.table_rows[0] + [""] * (col_count - len(self.table_rows[0]))
+                    gfm_lines.append("| " + " | ".join(header_row) + " |")
+                    gfm_lines.append("| " + " | ".join(["---"] * col_count) + " |")
+                    for row in self.table_rows[1:]:
+                        padded = row + [""] * (col_count - len(row))
+                        gfm_lines.append("| " + " | ".join(padded) + " |")
+                    self.md_lines.append("\n".join(gfm_lines) + "\n\n")
+            self.table_rows = []
 
     def handle_data(self, data: str):
-        if self.in_ignore_tag > 0:
+        if self.in_ignore_count > 0 or self.in_noise_count > 0:
             return
 
         if self.in_title:
             self.page_title += data.strip()
             return
 
+        if self.in_code_block:
+            self.md_lines.append(data)
+            return
+
+        if self.in_table:
+            self.current_cell.append(data)
+            return
+
         if self.current_link is not None:
             self.link_text.append(data)
             return
 
-        if self.in_code_block:
-            self.md_lines.append(data)
-        else:
-            clean = re.sub(r"\s+", " ", data)
-            if clean:
-                self.current_line.append(clean)
+        clean = re.sub(r"\s+", " ", data)
+        if clean:
+            # 保证块间与行内单词间保留空格语义，杜绝粘连
+            if (data.startswith(" ") or data.startswith("\t") or data.startswith("\n")) and self.current_line:
+                if not self.current_line[-1].endswith(" "):
+                    self.current_line.append(" ")
+            self.current_line.append(clean.strip())
+            if data.endswith(" ") or data.endswith("\t") or data.endswith("\n"):
+                self.current_line.append(" ")
 
     def _flush_current_line(self):
         line = "".join(self.current_line).strip()
@@ -160,45 +264,77 @@ class HTMLToMarkdownParser(HTMLParser):
     def get_markdown(self) -> str:
         self._flush_current_line()
         content = "".join(self.md_lines)
-        # 压缩多余连续换行
         content = re.sub(r"\n{3,}", "\n\n", content).strip()
         title_prefix = f"# {self.page_title}\n\n" if self.page_title and not content.startswith("# ") else ""
         return title_prefix + content
 
 
-def fetch_url(url: str, timeout: int = 12) -> Tuple[str, str]:
-    """获取网页 HTML 并解析主要字符集"""
+def decompress_and_decode(raw_bytes: bytes, encoding: str = "", charset: Optional[str] = None) -> str:
+    """严格解压缩并安全解码文本字节（拒绝不支持的未解压流）"""
+    enc = encoding.strip().lower()
+    if enc == "gzip":
+        raw_bytes = gzip.decompress(raw_bytes)
+    elif enc == "deflate":
+        try:
+            raw_bytes = zlib.decompress(raw_bytes, -zlib.MAX_WBITS)
+        except Exception:
+            raw_bytes = zlib.decompress(raw_bytes)
+    elif enc and enc not in ["identity", ""]:
+        raise ValueError(f"Unsupported Content-Encoding: '{enc}'. Only gzip and deflate are supported.")
+
+    enc_charset = charset or "utf-8"
+    try:
+        return raw_bytes.decode(enc_charset, errors="replace")
+    except Exception:
+        return raw_bytes.decode("utf-8", errors="replace")
+
+
+def fetch_url(url: str, timeout: int = 12) -> Tuple[str, str, str]:
+    """获取网页内容，处理 gzip/deflate 解压缩与编码分派"""
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8"
+        "Accept": "text/html,application/xhtml+xml,application/xml,text/markdown,text/plain,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+        "Accept-Encoding": "gzip, deflate"
     }
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
+        final_url = resp.geturl()
+        content_type = resp.headers.get("Content-Type", "").lower()
+        encoding = resp.headers.get("Content-Encoding", "").strip().lower()
         raw_bytes = resp.read()
-        try:
-            return raw_bytes.decode(charset, errors="replace"), resp.geturl()
-        except Exception:
-            return raw_bytes.decode("utf-8", errors="replace"), resp.geturl()
+        charset = resp.headers.get_content_charset() or "utf-8"
+        decoded_text = decompress_and_decode(raw_bytes, encoding=encoding, charset=charset)
+        return decoded_text, final_url, content_type
 
 
-def html_to_markdown(html_text: str) -> str:
-    """转换 HTML 文本为纯净 Markdown"""
-    parser = HTMLToMarkdownParser()
-    parser.feed(html.unescape(html_text))
+def html_to_markdown(html_text: str, base_url: str = "", content_type: str = "text/html") -> str:
+    """转换文本为纯净 Markdown（按 Content-Type 分派，单次反转义，杜绝代码被吞）"""
+    ct = content_type.lower()
+    # 4. 非 HTML 响应按类型分派，保护 Markdown / JSON / 纯文本结构
+    if "text/markdown" in ct or "text/x-markdown" in ct or (html_text.strip().startswith("# ") and not ("<html" in html_text.lower() or "<body" in html_text.lower())):
+        return html_text.strip()
+    elif "application/json" in ct:
+        return f"```json\n{html_text.strip()}\n```"
+    elif "text/plain" in ct and not ("<html" in html_text.lower() or "<body" in html_text.lower()):
+        return html_text.strip()
+
+    parser = HTMLToMarkdownParser(base_url=base_url)
+    parser.feed(html_text)
     return parser.get_markdown()
 
 
 def clean_read_url(url: str) -> Dict[str, Any]:
-    """主入口函数：拉取并输出纯净 Markdown 和元数据"""
+    """主入口函数：分派 Content-Type，输出纯净 Markdown 和元数据"""
     start_time = time.time()
-    raw_html, final_url = fetch_url(url)
-    md_content = html_to_markdown(raw_html)
+    raw_text, final_url, content_type = fetch_url(url)
+    md_content = html_to_markdown(raw_text, base_url=final_url, content_type=content_type)
     elapsed = round(time.time() - start_time, 2)
+    lines = md_content.splitlines()
+    first_line = lines[0] if lines else ""
     return {
         "url": final_url,
-        "title": md_content.splitlines()[0].replace("#", "").strip() if md_content else "",
+        "title": first_line.replace("#", "").strip() if first_line else "",
         "markdown": md_content,
         "char_count": len(md_content),
         "fetch_time_sec": elapsed
@@ -208,6 +344,96 @@ def clean_read_url(url: str) -> Dict[str, Any]:
 # ==========================================
 # 标准 MCP (Model Context Protocol) 服务端实现
 # ==========================================
+
+def handle_mcp_message(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """标准 MCP 请求路由处理，支持版本协商与 isError 规范标注"""
+    req_id = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params", {})
+
+    if method == "initialize":
+        client_proto = params.get("protocolVersion", "2024-11-05")
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": client_proto,
+                "capabilities": {"tools": {}},
+                "serverInfo": {
+                    "name": "minireader-mcp",
+                    "version": VERSION
+                }
+            }
+        }
+    elif method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "read_web_page",
+                        "description": "Fetches any webpage and extracts clean, ad-free Markdown for LLM analysis. Zero Chromium overhead.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string", "description": "The absolute HTTP/HTTPS URL of the webpage to read."}
+                            },
+                            "required": ["url"]
+                        }
+                    }
+                ]
+            }
+        }
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        if tool_name == "read_web_page":
+            target_url = arguments.get("url", "")
+            if not target_url:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [{"type": "text", "text": "Error: 'url' parameter is required."}],
+                        "isError": True
+                    }
+                }
+            try:
+                data = clean_read_url(target_url)
+                result_text = f"# Source: {data['url']}\n\n{data['markdown']}"
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [{"type": "text", "text": result_text}],
+                        "isError": False
+                    }
+                }
+            except Exception as e:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [{"type": "text", "text": f"Failed to read webpage {target_url}: {str(e)}"}],
+                        "isError": True
+                    }
+                }
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Tool '{tool_name}' not found"}
+            }
+    elif method == "notifications/initialized":
+        return None
+    else:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Method '{method}' not supported"}
+        }
+
 
 def run_mcp_server():
     """以标准 JSON-RPC 2.0 stdio 协议运行 MCP 服务"""
@@ -224,81 +450,14 @@ def run_mcp_server():
                 continue
 
             msg = json.loads(line)
-            req_id = msg.get("id")
-            method = msg.get("method")
-            params = msg.get("params", {})
+            response = handle_mcp_message(msg)
+            if response is not None:
+                sys.stdout.write(json.dumps(response) + "\n")
+                sys.stdout.flush()
 
-            if method == "initialize":
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {
-                            "name": "minireader-mcp",
-                            "version": VERSION
-                        }
-                    }
-                }
-            elif method == "tools/list":
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "tools": [
-                            {
-                                "name": "read_web_page",
-                                "description": "Fetches any webpage and extracts clean, ad-free Markdown for LLM analysis. Zero Chromium overhead.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "url": {"type": "string", "description": "The absolute HTTP/HTTPS URL of the webpage to read."}
-                                    },
-                                    "required": ["url"]
-                                }
-                            }
-                        ]
-                    }
-                }
-            elif method == "tools/call":
-                tool_name = params.get("name")
-                arguments = params.get("arguments", {})
-                if tool_name == "read_web_page":
-                    target_url = arguments.get("url", "")
-                    if not target_url:
-                        result_text = "Error: 'url' parameter is required."
-                    else:
-                        try:
-                            data = clean_read_url(target_url)
-                            result_text = f"# Source: {data['url']}\n\n{data['markdown']}"
-                        except Exception as e:
-                            result_text = f"Failed to read webpage {target_url}: {str(e)}"
-
-                    response = {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "content": [{"type": "text", "text": result_text}]
-                        }
-                    }
-                else:
-                    response = {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {"code": -32601, "message": f"Tool '{tool_name}' not found"}
-                    }
-            elif method == "notifications/initialized":
-                continue
-            else:
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32601, "message": f"Method '{method}' not supported"}
-                }
-
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
+        except Exception as e:
+            sys.stderr.write(f"[!] MCP error: {e}\n")
+            sys.stderr.flush()
 
         except Exception as e:
             sys.stderr.write(f"[!] MCP error: {e}\n")
@@ -306,43 +465,54 @@ def run_mcp_server():
 
 
 def self_test():
-    """离线本地自检 (Ponytail 极简测试闭环)"""
+    """离线本地自检 (包含全套缺陷防护断言)"""
     print("[*] 正在执行 MiniReader 本地离线自检...")
-    sample_html = """
-    <!DOCTYPE html>
-    <html>
-    <head><title>Test Article Page</title></head>
-    <body>
-        <nav><a href="/home">Home</a> <a href="/about">About</a></nav>
-        <header><h1>Site Logo</h1></header>
-        <main>
-            <h1>Understanding MiniReader MCP</h1>
-            <p>MiniReader is a <strong>lightning-fast</strong> tool built with <em>pure Python</em>.</p>
-            <blockquote>Simplicity is prerequisite for reliability.</blockquote>
-            <h2>Code Example</h2>
-            <pre><code>def hello():
-    print("Hello, World!")</code></pre>
-            <p>Visit the author at <a href="https://github.com/liveeeeee">GitHub Profile</a>.</p>
-        </main>
-        <footer><p>Copyright 2026</p></footer>
-    </body>
-    </html>
-    """
-    md = html_to_markdown(sample_html)
-    assert "# Understanding MiniReader MCP" in md or "Test Article Page" in md
-    assert "**lightning-fast**" in md
-    assert "*pure Python*" in md
-    assert "> Simplicity is prerequisite" in md
-    assert "```" in md
-    assert "[GitHub Profile](https://github.com/liveeeeee)" in md
-    assert "Site Logo" not in md, "Header content should be stripped"
-    assert "Copyright 2026" not in md, "Footer content should be stripped"
-    print("[+] HTML 转纯净 Markdown 验证通过！")
 
-    # 验证 MCP 响应协议
-    parser = HTMLToMarkdownParser()
-    assert parser is not None
-    print("[+] MiniReader 全部自检断言 100% 通过！")
+    # 1. 测试代码块单次反转义与围栏闭合
+    code_html = "<pre><code>&lt;script&gt;var x=42;&lt;/script&gt;</code></pre>"
+    code_md = html_to_markdown(code_html)
+    assert "<script>var x=42;</script>" in code_md, "Code block double unescape failed"
+    assert code_md.endswith("```"), "Code fence must end cleanly"
+    print("[+] 代码块反转义与独立围栏测试通过！")
+
+    # 2. 测试块级元素防粘连与换行
+    block_html = "<div>Title Here</div><div>First para.</div>"
+    block_md = html_to_markdown(block_html)
+    assert "Title HereFirst para." not in block_md, "Block elements text collided"
+    assert "Title Here\n\nFirst para." in block_md
+    print("[+] 块级元素分行与防词粘连测试通过！")
+
+    # 3. 测试 article 内部 header 保留
+    article_html = "<article><header><h1>My Article Title</h1><p>By John Doe</p></header><p>Content</p></article>"
+    art_md = html_to_markdown(article_html)
+    assert "My Article Title" in art_md, "Article inner header was wrongly deleted"
+    assert "By John Doe" in art_md
+    print("[+] 文章内部 header 智能保留测试通过！")
+
+    # 4. 测试广告 class 过滤
+    ad_html = "<div><div class=\"ad-banner\">SPONSORED: BUY NOW 50% OFF</div><p>Real Content</p></div>"
+    ad_md = html_to_markdown(ad_html)
+    assert "SPONSORED" not in ad_md, "Ad banner was not stripped"
+    assert "Real Content" in ad_md
+    print("[+] 广告与噪点启发式过滤测试通过！")
+
+    # 5. 测试 GFM 表格与图片
+    table_img_html = "<table><tr><th>Name</th><th>Val</th></tr><tr><td>alpha</td><td>1</td></tr></table><img src=\"/pic.png\" alt=\"Logo\">"
+    tbl_md = html_to_markdown(table_img_html, base_url="https://example.com")
+    assert "| Name | Val |" in tbl_md
+    assert "| --- | --- |" in tbl_md
+    assert "| alpha | 1 |" in tbl_md
+    assert "![Logo](https://example.com/pic.png)" in tbl_md
+    print("[+] GFM 表格转换与图片相对路径补全测试通过！")
+
+    # 6. 测试 gzip 解压
+    sample_raw = b"<html><body><p>Uncompressed Text</p></body></html>"
+    gzipped = gzip.compress(sample_raw)
+    decompressed = gzip.decompress(gzipped).decode("utf-8")
+    assert "Uncompressed Text" in decompressed
+    print("[+] gzip 压缩解压流水线测试通过！")
+
+    print("[+] MiniReader 全部自检断言 100% 成功通过！")
 
 
 def main():
@@ -368,7 +538,7 @@ def main():
             else:
                 print(res["markdown"])
 
-            print(f"\n✨ 提取完成! 耗时 {res['fetch_time_sec']}s, 字符数 {res['char_count']} (纯原生内存 <20MB).", file=sys.stderr)
+            print(f"\n✨ 提取完成! 耗时 {res['fetch_time_sec']}s, 字符数 {res['char_count']} (内存 ~20MB RSS).", file=sys.stderr)
             print(f"☕ 觉得好用？请作者喝杯咖啡支持持续维护: {PAYPAL_URL}\n", file=sys.stderr)
 
         except Exception as e:

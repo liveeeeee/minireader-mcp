@@ -1,7 +1,7 @@
 # ⚡ MiniReader MCP
 
 > **Ultra-lightweight Web-to-Markdown CLI & Model Context Protocol (MCP) Server.**  
-> Zero Chromium bloat, zero heavy dependencies, < 20MB memory footprint.  
+> Zero Chromium bloat, zero external dependencies, ~20MB peak RSS memory footprint.  
 > 纯原生标准库构建、零外部依赖、极致轻量的网页正文提取与 Markdown 转换工具。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -21,8 +21,9 @@ Existing web-reading solutions for AI agents (Playwright MCP, Puppeteer, Seleniu
 
 **MiniReader solves this completely:**
 - ✅ **Pure Python Standard Library**: ZERO `pip install` required.
-- ✅ **Tiny Footprint**: Starts in 0.05s, uses < 20MB RAM.
-- ✅ **Smart Readability**: Strips ads, navigation, banners, cookies, and tracking scripts.
+- ✅ **Tiny Footprint**: ~0.05s internal execution / ~0.31s CLI end-to-end, ~20MB peak RSS RAM.
+- ✅ **Smart Readability**: Strips ads, navigation, banners, cookies, and tracking scripts via heuristic class/id detection and tag filtering.
+- ✅ **Full Format Support**: Transparent gzip/deflate decompression, GFM table conversion, and image URL resolution.
 - ✅ **Dual-Mode**: Works as an instant terminal CLI and a standard **MCP Server** for **Claude Desktop / Cursor / Windsurf**.
 
 ---
