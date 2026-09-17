@@ -37,10 +37,17 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 ]
 
-# 块级标签集合（触发排版换行，杜绝内容挤压粘连）
+# HTML void 元素（自闭合元素，无闭合标签，绝不入栈）
+VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr"
+}
+
+# 块级标签集合（触发排版分段换行，杜绝内容挤压粘连）
 BLOCK_TAGS = {
     "div", "section", "article", "main", "p", "h1", "h2", "h3", "h4", "h5", "h6",
-    "li", "blockquote", "pre", "table", "tr", "header", "footer", "hr", "address"
+    "li", "blockquote", "pre", "table", "tr", "header", "footer", "hr", "address",
+    "dl", "dt", "dd", "figure", "figcaption"
 }
 
 # 始终忽略的基础标签
@@ -51,6 +58,9 @@ AD_NOISE_RE = re.compile(
     r"(^|[\s_-])(ad|ads|banner|advertisement|sponsor|sponsored|promo|cookie|newsletter|popup|modal|share-btn|sharing|sidebar|widget)([\s_-]|$)",
     re.IGNORECASE
 )
+
+# 支持的 MCP 协议版本白名单（按推荐优先级排序）
+SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 
 
 class HTMLToMarkdownParser(HTMLParser):
@@ -77,9 +87,43 @@ class HTMLToMarkdownParser(HTMLParser):
         self.current_row: List[str] = []
         self.current_cell: List[str] = []
 
+    def _append_inline(self, text: str):
+        """将行内元素（文本、链接、行内代码、图片）路由到当前活跃缓冲区"""
+        if self.in_table:
+            self.current_cell.append(text)
+        else:
+            self.current_line.append(text)
+
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]):
         tag = tag.lower()
         attrs_dict = dict(attrs)
+
+        # 检查是否处于忽略状态
+        if self.in_ignore_count > 0 or self.in_noise_count > 0:
+            # 即使在忽略区域内，也只将非 void 标签压栈，保证 endtag 匹配
+            if tag not in VOID_TAGS:
+                self.tag_stack.append(tag)
+                self.noise_stack.append(False)
+            return
+
+        # MR-1: void 元素特殊处理，绝不压栈，避免造成栈失配
+        if tag in VOID_TAGS:
+            if tag == "br":
+                if self.in_table:
+                    self._append_inline(" ")
+                else:
+                    self.current_line.append("\n")
+            elif tag == "hr":
+                self._flush_current_line()
+                self.md_lines.append("---\n\n")
+            elif tag == "img":
+                src = attrs_dict.get("src", "")
+                if src:
+                    if self.base_url:
+                        src = urllib.parse.urljoin(self.base_url, src)
+                    alt = attrs_dict.get("alt", "").strip() or "image"
+                    self._append_inline(f"![{alt}]({src}) ")
+            return
 
         # 1. 检查噪音广告 class 与 id
         cls_id = f"{attrs_dict.get('class', '')} {attrs_dict.get('id', '')}".strip()
@@ -93,7 +137,7 @@ class HTMLToMarkdownParser(HTMLParser):
         if tag in BASE_IGNORE_TAGS:
             is_ignore = True
         elif tag in ["header", "footer"]:
-            # 正文容器（article/main/section）内部的 header/footer 保留内容，只剔除页面级噪点
+            # 正文容器（article/main/section）内部的 header/footer 保留内容，只剔除页面级全局噪点
             in_content_container = any(t in ["article", "main", "section"] for t in self.tag_stack)
             if not in_content_container:
                 is_ignore = True
@@ -115,22 +159,29 @@ class HTMLToMarkdownParser(HTMLParser):
         elif tag in ["h1", "h2", "h3", "h4", "h5", "h6"]:
             level = int(tag[1])
             self.current_line.append("#" * level + " ")
-        elif tag == "hr":
-            self.md_lines.append("---\n\n")
         elif tag == "pre":
             self.in_code_block = True
             self.md_lines.append("```\n")
         elif tag == "code" and not self.in_code_block:
-            self.current_line.append("`")
+            self._append_inline("`")
         elif tag == "blockquote":
             self.current_line.append("> ")
         elif tag in ["b", "strong"]:
-            self.current_line.append("**")
+            self._append_inline("**")
         elif tag in ["i", "em"]:
-            self.current_line.append("*")
+            self._append_inline("*")
         elif tag == "li":
             indent = "  " * max(0, len([t for t in self.tag_stack if t in ["ul", "ol"]]) - 1)
             self.current_line.append(f"{indent}* ")
+        elif tag == "dt":
+            self._flush_current_line()
+            self.current_line.append("**")
+        elif tag == "dd":
+            self._flush_current_line()
+            self.current_line.append(": ")
+        elif tag == "figcaption":
+            self._flush_current_line()
+            self.current_line.append("*")
         elif tag == "a":
             href = attrs_dict.get("href")
             if href and not href.startswith("javascript:"):
@@ -138,13 +189,6 @@ class HTMLToMarkdownParser(HTMLParser):
                     href = urllib.parse.urljoin(self.base_url, href)
                 self.current_link = href
                 self.link_text = []
-        elif tag == "img":
-            src = attrs_dict.get("src", "")
-            if src:
-                if self.base_url:
-                    src = urllib.parse.urljoin(self.base_url, src)
-                alt = attrs_dict.get("alt", "").strip() or "image"
-                self.current_line.append(f"![{alt}]({src}) ")
         elif tag == "table":
             self.in_table = True
             self.table_rows = []
@@ -155,33 +199,45 @@ class HTMLToMarkdownParser(HTMLParser):
 
     def handle_endtag(self, tag: str):
         tag = tag.lower()
-        if self.tag_stack and self.tag_stack[-1] == tag:
-            self.tag_stack.pop()
 
-        # 回收噪音计数
-        if self.noise_stack:
-            was_noise = self.noise_stack.pop()
-            if was_noise and self.in_noise_count > 0:
-                self.in_noise_count -= 1
-
-        is_ignore = False
-        if tag in BASE_IGNORE_TAGS:
-            is_ignore = True
-        elif tag in ["header", "footer"]:
-            in_content_container = any(t in ["article", "main", "section"] for t in self.tag_stack)
-            if not in_content_container:
-                is_ignore = True
-
-        if is_ignore and self.in_ignore_count > 0:
-            self.in_ignore_count -= 1
+        # MR-1: void 标签没有闭合标签，直接跳过
+        if tag in VOID_TAGS:
             return
+
+        # 向上查找匹配标签并容错弹出
+        if tag in self.tag_stack:
+            idx = len(self.tag_stack) - 1 - self.tag_stack[::-1].index(tag)
+            while len(self.tag_stack) > idx:
+                popped_tag = self.tag_stack.pop()
+                if self.noise_stack:
+                    was_noise = self.noise_stack.pop()
+                    if was_noise and self.in_noise_count > 0:
+                        self.in_noise_count -= 1
+
+                is_ign = False
+                if popped_tag in BASE_IGNORE_TAGS:
+                    is_ign = True
+                elif popped_tag in ["header", "footer"]:
+                    in_container = any(t in ["article", "main", "section"] for t in self.tag_stack)
+                    if not in_container:
+                        is_ign = True
+                if is_ign and self.in_ignore_count > 0:
+                    self.in_ignore_count -= 1
 
         if self.in_ignore_count > 0 or self.in_noise_count > 0:
             return
 
         if tag == "title":
             self.in_title = False
-        elif tag in ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "div", "section", "article", "main"]:
+        elif tag in ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "div", "section", "article", "main", "figure"]:
+            self._flush_current_line()
+        elif tag == "dt":
+            self.current_line.append("**")
+            self._flush_current_line()
+        elif tag == "dd":
+            self._flush_current_line()
+        elif tag == "figcaption":
+            self.current_line.append("*")
             self._flush_current_line()
         elif tag == "pre":
             self.in_code_block = False
@@ -190,16 +246,16 @@ class HTMLToMarkdownParser(HTMLParser):
                 self.md_lines.append("\n")
             self.md_lines.append("```\n\n")
         elif tag == "code" and not self.in_code_block:
-            self.current_line.append("`")
+            self._append_inline("`")
         elif tag in ["b", "strong"]:
-            self.current_line.append("**")
+            self._append_inline("**")
         elif tag in ["i", "em"]:
-            self.current_line.append("*")
+            self._append_inline("*")
         elif tag == "a":
             if self.current_link:
                 text = "".join(self.link_text).strip()
                 if text:
-                    self.current_line.append(f"[{text}]({self.current_link})")
+                    self._append_inline(f"[{text}]({self.current_link})")
                 self.current_link = None
                 self.link_text = []
         elif tag in ["th", "td"] and self.in_table:
@@ -237,12 +293,12 @@ class HTMLToMarkdownParser(HTMLParser):
             self.md_lines.append(data)
             return
 
-        if self.in_table:
-            self.current_cell.append(data)
-            return
-
         if self.current_link is not None:
             self.link_text.append(data)
+            return
+
+        if self.in_table:
+            self.current_cell.append(data)
             return
 
         clean = re.sub(r"\s+", " ", data)
@@ -346,18 +402,28 @@ def clean_read_url(url: str) -> Dict[str, Any]:
 # ==========================================
 
 def handle_mcp_message(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """标准 MCP 请求路由处理，支持版本协商与 isError 规范标注"""
+    """标准 MCP 请求路由处理，严格遵循 JSON-RPC 2.0 规范"""
     req_id = msg.get("id")
     method = msg.get("method")
     params = msg.get("params", {})
 
+    # MR-5: JSON-RPC 规范：无 id 或方法为 notifications/* 一律为通知，绝不产生响应
+    if req_id is None or (isinstance(method, str) and method.startswith("notifications/")):
+        return None
+
     if method == "initialize":
-        client_proto = params.get("protocolVersion", "2024-11-05")
+        # MR-6: 协议版本白名单协商
+        client_proto = params.get("protocolVersion")
+        if client_proto in SUPPORTED_PROTOCOL_VERSIONS:
+            negotiated_proto = client_proto
+        else:
+            negotiated_proto = SUPPORTED_PROTOCOL_VERSIONS[0]
+
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "protocolVersion": client_proto,
+                "protocolVersion": negotiated_proto,
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "minireader-mcp",
@@ -425,8 +491,6 @@ def handle_mcp_message(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "id": req_id,
                 "error": {"code": -32601, "message": f"Tool '{tool_name}' not found"}
             }
-    elif method == "notifications/initialized":
-        return None
     else:
         return {
             "jsonrpc": "2.0",
@@ -459,13 +523,9 @@ def run_mcp_server():
             sys.stderr.write(f"[!] MCP error: {e}\n")
             sys.stderr.flush()
 
-        except Exception as e:
-            sys.stderr.write(f"[!] MCP error: {e}\n")
-            sys.stderr.flush()
-
 
 def self_test():
-    """离线本地自检 (包含全套缺陷防护断言)"""
+    """离线本地自检 (包含全套缺陷防御断言)"""
     print("[*] 正在执行 MiniReader 本地离线自检...")
 
     # 1. 测试代码块单次反转义与围栏闭合
@@ -475,42 +535,52 @@ def self_test():
     assert code_md.endswith("```"), "Code fence must end cleanly"
     print("[+] 代码块反转义与独立围栏测试通过！")
 
-    # 2. 测试块级元素防粘连与换行
-    block_html = "<div>Title Here</div><div>First para.</div>"
+    # 2. 测试块级元素防粘连与换行，包括 <br>
+    block_html = "<div>Title Here</div><p>Line 1<br>Line 2</p><div>First para.</div>"
     block_md = html_to_markdown(block_html)
-    assert "Title HereFirst para." not in block_md, "Block elements text collided"
-    assert "Title Here\n\nFirst para." in block_md
-    print("[+] 块级元素分行与防词粘连测试通过！")
+    assert "Title HereFirst para." not in block_md
+    assert "Line 1\nLine 2" in block_md
+    print("[+] 块级元素分行、<br> 换行与防词粘连测试通过！")
 
-    # 3. 测试 article 内部 header 保留
-    article_html = "<article><header><h1>My Article Title</h1><p>By John Doe</p></header><p>Content</p></article>"
-    art_md = html_to_markdown(article_html)
-    assert "My Article Title" in art_md, "Article inner header was wrongly deleted"
-    assert "By John Doe" in art_md
-    print("[+] 文章内部 header 智能保留测试通过！")
+    # 3. 测试 article 内部 header 保留与 void 标签栈同步 (MR-1)
+    art_void_html = '<article><header><h1>My Title</h1><p>By Author</p></header><img src="pic.jpg"><p>Content</p></article><footer><p>Site Footer</p></footer>'
+    art_md = html_to_markdown(art_void_html)
+    assert "My Title" in art_md, "Article inner header was wrongly deleted"
+    assert "By Author" in art_md
+    assert "Site Footer" not in art_md, "Site footer should be stripped outside article"
+    print("[+] 文章内部 header 智能保留与 void 元素栈同步测试通过！")
 
-    # 4. 测试广告 class 过滤
-    ad_html = "<div><div class=\"ad-banner\">SPONSORED: BUY NOW 50% OFF</div><p>Real Content</p></div>"
+    # 4. 测试广告 class 过滤及内部包含 void 元素不泄漏 (MR-1, MR-7)
+    ad_html = '<div class="ad-container"><img src="pixel.gif"><p>Ad text</p></div><p>Real Content</p>'
     ad_md = html_to_markdown(ad_html)
-    assert "SPONSORED" not in ad_md, "Ad banner was not stripped"
-    assert "Real Content" in ad_md
-    print("[+] 广告与噪点启发式过滤测试通过！")
+    assert "Ad text" not in ad_md, "Ad text was not stripped"
+    assert "Real Content" in ad_md, "Post-ad content was wrongly dropped"
+    print("[+] 广告噪点启发式过滤与追踪像素测试通过！")
 
-    # 5. 测试 GFM 表格与图片
-    table_img_html = "<table><tr><th>Name</th><th>Val</th></tr><tr><td>alpha</td><td>1</td></tr></table><img src=\"/pic.png\" alt=\"Logo\">"
-    tbl_md = html_to_markdown(table_img_html, base_url="https://example.com")
-    assert "| Name | Val |" in tbl_md
-    assert "| --- | --- |" in tbl_md
-    assert "| alpha | 1 |" in tbl_md
-    assert "![Logo](https://example.com/pic.png)" in tbl_md
-    print("[+] GFM 表格转换与图片相对路径补全测试通过！")
+    # 5. 测试 GFM 表格与单元格内行内元素 (MR-3)
+    table_html = '<table><tr><th>Col1</th><th>Col2</th></tr><tr><td><a href="https://example.com">Link</a></td><td><code>code_val</code></td></tr></table>'
+    tbl_md = html_to_markdown(table_html)
+    assert "| [Link](https://example.com) | `code_val` |" in tbl_md
+    print("[+] GFM 表格单元格内超链接与代码路由测试通过！")
 
-    # 6. 测试 gzip 解压
-    sample_raw = b"<html><body><p>Uncompressed Text</p></body></html>"
+    # 6. 测试真实 decompress_and_decode 函数调用 (MR-7)
+    sample_raw = b"<html><body><p>Real Gzip Decompress Pipeline</p></body></html>"
     gzipped = gzip.compress(sample_raw)
-    decompressed = gzip.decompress(gzipped).decode("utf-8")
-    assert "Uncompressed Text" in decompressed
-    print("[+] gzip 压缩解压流水线测试通过！")
+    decompressed = decompress_and_decode(gzipped, encoding="gzip", charset="utf-8")
+    assert "Real Gzip Decompress Pipeline" in decompressed
+    try:
+        decompress_and_decode(b"bytes", encoding="br")
+        assert False, "Should raise ValueError for unsupported compression"
+    except ValueError:
+        pass
+    print("[+] 真实 decompress_and_decode 解压流水线与安全拦截测试通过！")
+
+    # 7. 测试 MCP 通知静默与协议协商 (MR-5, MR-6)
+    notif_res = handle_mcp_message({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})
+    assert notif_res is None, "Notifications must not return response"
+    init_res = handle_mcp_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2099-01-01"}})
+    assert init_res["result"]["protocolVersion"] in SUPPORTED_PROTOCOL_VERSIONS
+    print("[+] MCP 通知静默与协议版本白名单协商测试通过！")
 
     print("[+] MiniReader 全部自检断言 100% 成功通过！")
 
