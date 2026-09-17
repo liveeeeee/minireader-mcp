@@ -80,6 +80,7 @@ class HTMLToMarkdownParser(HTMLParser):
         self.link_text: List[str] = []
         self.page_title = ""
         self.in_title = False
+        self.list_stack: List[Dict[str, Any]] = []
 
         # 表格状态追踪
         self.in_table = False
@@ -170,9 +171,18 @@ class HTMLToMarkdownParser(HTMLParser):
             self._append_inline("**")
         elif tag in ["i", "em"]:
             self._append_inline("*")
+        elif tag == "ul":
+            self.list_stack.append({"type": "ul", "count": 0})
+        elif tag == "ol":
+            self.list_stack.append({"type": "ol", "count": 0})
         elif tag == "li":
-            indent = "  " * max(0, len([t for t in self.tag_stack if t in ["ul", "ol"]]) - 1)
-            self.current_line.append(f"{indent}* ")
+            depth = max(0, len(self.list_stack) - 1)
+            indent = "  " * depth
+            if self.list_stack and self.list_stack[-1]["type"] == "ol":
+                self.list_stack[-1]["count"] += 1
+                self.current_line.append(f"{indent}{self.list_stack[-1]['count']}. ")
+            else:
+                self.current_line.append(f"{indent}* ")
         elif tag == "dt":
             self._flush_current_line()
             self.current_line.append("**")
@@ -231,6 +241,10 @@ class HTMLToMarkdownParser(HTMLParser):
             self.in_title = False
         elif tag in ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "div", "section", "article", "main", "figure"]:
             self._flush_current_line()
+        elif tag in ["ul", "ol"]:
+            if self.list_stack:
+                self.list_stack.pop()
+            self._flush_current_line()
         elif tag == "dt":
             self.current_line.append("**")
             self._flush_current_line()
@@ -260,6 +274,8 @@ class HTMLToMarkdownParser(HTMLParser):
                 self.link_text = []
         elif tag in ["th", "td"] and self.in_table:
             cell_text = "".join(self.current_cell).strip().replace("\n", " ")
+            # 转义单元格内的未转义竖线 |，防止破坏 GFM 表格列对齐结构
+            cell_text = re.sub(r"(?<!\\)\|", r"\|", cell_text)
             self.current_row.append(cell_text)
             self.current_cell = []
         elif tag == "tr" and self.in_table:
@@ -346,7 +362,11 @@ def decompress_and_decode(raw_bytes: bytes, encoding: str = "", charset: Optiona
 
 
 def fetch_url(url: str, timeout: int = 12) -> Tuple[str, str, str]:
-    """获取网页内容，处理 gzip/deflate 解压缩与编码分派"""
+    """获取网页内容，处理 gzip/deflate 解压缩与编码分派（严格校验 HTTP/HTTPS 协议）"""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise ValueError(f"Forbidden URL scheme '{parsed.scheme}': only http and https are allowed")
+
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml,text/markdown,text/plain,application/json;q=0.9,*/*;q=0.8",
@@ -513,10 +533,25 @@ def run_mcp_server():
             if not line:
                 continue
 
-            msg = json.loads(line)
+            try:
+                msg = json.loads(line)
+            except Exception as e:
+                # JSON-RPC 2.0 规范：Parse error (-32700)
+                err_resp = {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32700,
+                        "message": f"Parse error: {str(e)}"
+                    }
+                }
+                sys.stdout.write(json.dumps(err_resp, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+                continue
+
             response = handle_mcp_message(msg)
             if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
+                sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
                 sys.stdout.flush()
 
         except Exception as e:
